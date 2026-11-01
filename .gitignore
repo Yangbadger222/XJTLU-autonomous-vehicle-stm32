@@ -1,35 +1,3 @@
-# Publish only firmware source, build configuration, and tests.
-*
-!.gitignore
-!.mxproject
-!Makefile
-!RM_C_Board.ioc
-!STM32F407IGHx_FLASH.ld
-!startup_stm32f407xx.s
-
-!.vscode/
-!.vscode/*.json
-!.vscode/*.yaml
-
-!Core/
-!Core/Inc/
-!Core/Inc/**/
-!Core/Inc/**/*.h
-!Core/Src/
-!Core/Src/**/
-!Core/Src/**/*.c
-
-!Drivers/
-!Drivers/**/
-!Drivers/**/*.c
-!Drivers/**/*.h
-
-!test/
-!test/**/*.c
-!test/**/*.py
-
-# Never publish documentation, generated binaries, IDE build outputs, or caches.
-*.md
 docs/
 build/
 MDK-ARM/

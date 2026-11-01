@@ -7,6 +7,7 @@
 #include "drive_control.h"
 
 bool PS2_ReadFrame(GamepadFrame *frame);
+bool PS2_IsConnected(void);
 uint8_t PS2_RedLight(void);
 void PS2_SetInit(void);
 void PS2_Vibration(uint8_t motor1, uint8_t motor2);

@@ -88,6 +88,7 @@ void usart1_send(u8 data);
 void CLR_Buf(void);
 u8 Hand(char *a);
 void clrStruct(void);
+HAL_StatusTypeDef USART1_StartReceiveToIdle(void);
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus
@@ -95,4 +96,3 @@ void clrStruct(void);
 #endif
 
 #endif /* __USART_H__ */
-

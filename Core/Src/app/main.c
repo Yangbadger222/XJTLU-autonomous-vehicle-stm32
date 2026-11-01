@@ -62,7 +62,9 @@ uint16_t buffer_index = 0;
 
 extern FusionAhrs ahrs;
 
-int SERIAL_PERIOD_MS = 10; // 100HZ
+// Schedule telemetry at 100 Hz.  usart_printf() drops a frame while its DMA
+// buffer is busy, so a saturated serial link cannot corrupt an active frame.
+#define SERIAL_PERIOD_MS 10u // 100 Hz telemetry
 
 /* USER CODE END PV */
 
@@ -134,7 +136,7 @@ int main(void)
   Init_all();
   clrStruct();
   
-  TaskAdd(Serial_Output, SERIAL_PERIOD_MS); // 100Hz Serial
+  TaskAdd(Serial_Output, SERIAL_PERIOD_MS); // 100 Hz serial telemetry
  
 
   TaskAdd(Speed_set, 5); // 200Hz for wheel PID
@@ -144,11 +146,10 @@ int main(void)
  
 //  TaskAdd(ParseGpsBuffer, 100); // 10Hz
 
-  // (1) Start DMA reception
-  HAL_UART_Receive_DMA(&huart1, DMA_RX_Buffer, DMA_RX_BUF_SIZE);
-
-  // (2) Enable the idle interrupt (IDLE interrupt)
-  __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
+  if (USART1_StartReceiveToIdle() != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   /* USER CODE END 2 */
 
@@ -167,12 +168,10 @@ int main(void)
       uint16_t input_size = UART1_RX_Size;
 
       new_serial_data_received = 0;
-      if (input_size >= UART_RX_BUF_SIZE)
+      if (input_size > 0u && input_size < UART_RX_BUF_SIZE)
       {
-        input_size = UART_RX_BUF_SIZE - 1u;
+        Serial_Input((const char *)UART1_RX_Buffer);
       }
-      UART1_RX_Buffer[input_size] = '\0';
-      Serial_Input((const char *)UART1_RX_Buffer);
     }
   }
 
@@ -268,7 +267,10 @@ void Serial_Output(){
   //             (int)(FusionDegreesToRadians(gyroscope.axis.y) * 10000), 
   //             (int)(FusionDegreesToRadians(gyroscope.axis.z) * 10000));
 
-    usart_printf("%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f\n",
+    // Fields 1-16 are the legacy telemetry. Fields 17-19 (ctrl_mode, ps2_key,
+    // ps2_connected) are parsed by serial_reader and the FrogBoard server.
+    // ps2_key is not encoded by this firmware yet and is always 0.
+    usart_printf("%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%u,%u,%u\n",
                       x, y, z, // Position coordinates
                       Q.element.x,
                       Q.element.y,
@@ -281,7 +283,10 @@ void Serial_Output(){
 
                       magnetometer.axis.x,
                       magnetometer.axis.y,
-                      magnetometer.axis.z); // Magnetometer data
+                      magnetometer.axis.z, // Magnetometer data
+                      (unsigned int)DriveControl_GetCtrlMode(),
+                      0u,
+                      (unsigned int)(PS2_IsConnected() ? 1u : 0u));
 
   //  LongLat2XY(Convert_to_degrees(Save_Data.longitude),Convert_to_degrees(Save_Data.latitude),&gps_X,&gps_Y);
 //  LongLat2XY(120.742925,31.268221,&gps_X0,&gps_Y0);
@@ -320,29 +325,21 @@ void Serial_Output(){
 void Serial_Input(const char *input_data)
 {
   DriveCommand command;
-  float linear_mps;
-  float angular_radps;
-  char trailing;
+  uint8_t enable_code;
 
   if (input_data == NULL)
   {
     return;
   }
 
-  if (sscanf(input_data, "vcx=%f,wc=%f %c", &linear_mps, &angular_radps, &trailing) != 2)
-  {
-    return;
-  }
-  if (!isfinite(linear_mps) || !isfinite(angular_radps))
+  // Accepts "vcx=..,wc=.." and "vcx=..,wc=..,en=0|1|2" (see drive_control.h).
+  if (!DriveControl_ParseSerialPacket(input_data, HAL_GetTick(), &command, &enable_code))
   {
     return;
   }
 
-  command.valid = true;
-  command.received_ms = HAL_GetTick();
-  command.linear_mps = linear_mps;
-  command.angular_radps = angular_radps;
   DriveControl_SubmitSerialCommand(&command);
+  DriveControl_SubmitSerialEnable(enable_code, &command);
 }
 /* USER CODE END 4 */
 

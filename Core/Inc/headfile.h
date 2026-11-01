@@ -31,7 +31,7 @@
 #include "BMI088Middleware.h"
 #include "IMU.h"
 
-#include "ist8310driver_middleWare.h"
+#include "ist8310driver_middleware.h"
 #include "ist8310driver.h"
 #include "IST.h"
 

@@ -29,8 +29,6 @@ extern char input_buffer[];   // 引用主文件中的 input_buffer
 // extern const int BUFFER_SIZE; // 引用主文件中的 BUFFER_SIZE
 extern volatile uint8_t new_serial_data_received;
 
-extern void Serial_Input(const char* input_data);
-
 _SaveData Save_Data;
 
 extern uint8_t rx_char;
@@ -44,65 +42,46 @@ extern uint8_t DMA_RX_Buffer[DMA_RX_BUF_SIZE];
 extern uint8_t UART1_RX_Buffer[UART_RX_BUF_SIZE];
 extern volatile uint16_t UART1_RX_Size;
 extern volatile uint8_t new_serial_data_received;
-static volatile uint8_t uart1_rx_overflow = 0u;
 
-// void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-// {
-//     //usart_printf("Received: %c (ASCII: %d)\n", rx_char, rx_char);  // 打印每个接收到的字符
-//     // 将接收到的字节存储到缓冲区
-//     input_buffer[buffer_index++] = rx_char;
+HAL_StatusTypeDef USART1_StartReceiveToIdle(void)
+{
+    HAL_StatusTypeDef status = HAL_UARTEx_ReceiveToIdle_DMA(
+        &huart1, DMA_RX_Buffer, DMA_RX_BUF_SIZE);
 
-//     // 如果接收到换行符，表示数据包接收完毕
-//     if (rx_char == '\n') {
-//         input_buffer[buffer_index] = '\0';  // 以'\0'终止字符串
-//         new_serial_data_received = 1;  // 设置标志位，表示数据包接收完成
-//         buffer_index = 0;  // 重置缓冲区索引，以便接收下一个数据包
-//     }
+    if (status == HAL_OK)
+    {
+        // Command packets are short. Half-transfer events have no packet
+        // boundary and must not be treated as a received command.
+        __HAL_DMA_DISABLE_IT(&hdma_usart1_rx, DMA_IT_HT);
+    }
 
-//     // 如果缓冲区已满，重置缓冲区索引
-//     if (buffer_index >= BUFFER_SIZE) {
-//         buffer_index = 0;
-//     }
-
-//     // 继续接收下一个字节
-//     HAL_UART_Receive_DMA(&huart1, (uint8_t *)&rx_char, 1);
-// }
+    return status;
+}
 
 void USART1_IRQHandler(void)
 {
-    // 1) 判断是否是空闲中断
-    if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_IDLE) != RESET) {
-        __HAL_UART_CLEAR_IDLEFLAG(&huart1); // 清除标志
-
-        // Stop DMA before examining the received length.
-        HAL_UART_DMAStop(&huart1);
-
-        // IDLE is the only event that publishes a variable-length command.
-        uint16_t dataLength = DMA_RX_BUF_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart1_rx);
-        if (uart1_rx_overflow == 0u && dataLength > 0u && dataLength < UART_RX_BUF_SIZE) {
-            memcpy(UART1_RX_Buffer, DMA_RX_Buffer, dataLength);
-            UART1_RX_Size = dataLength;
-            new_serial_data_received = 1;
-        }
-
-        uart1_rx_overflow = 0u;
-        HAL_UART_Receive_DMA(&huart1, DMA_RX_Buffer, DMA_RX_BUF_SIZE);
-    }
-
-    // 2) 调用HAL库默认的中断处理(处理其他标志)
     HAL_UART_IRQHandler(&huart1);
 }
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
 {
     if (huart->Instance != USART1)
     {
         return;
     }
 
-    // A full DMA buffer has no IDLE-delimited packet boundary. The IDLE ISR
-    // discards this overflow and is the only path that restarts DMA.
-    uart1_rx_overflow = 1u;
+    if (HAL_UARTEx_GetRxEventType(huart) == HAL_UART_RXEVENT_IDLE
+        && size > 0u && size < UART_RX_BUF_SIZE)
+    {
+        memcpy(UART1_RX_Buffer, DMA_RX_Buffer, size);
+        UART1_RX_Buffer[size] = '\0';
+        UART1_RX_Size = size;
+        new_serial_data_received = 1u;
+    }
+
+    // A full-buffer event is an overflow and is deliberately discarded. In
+    // either case, start a fresh receive window for the next newline packet.
+    (void)USART1_StartReceiveToIdle();
 }
 
 
