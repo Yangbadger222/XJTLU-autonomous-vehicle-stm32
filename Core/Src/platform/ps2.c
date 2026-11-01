@@ -13,10 +13,12 @@
 #define CLK_L HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET)
 
 #define PS2_CLOCK_DELAY_US 10u
+#define PS2_CONNECTED_TIMEOUT_MS 200u
 
 static uint8_t latest_response[PS2_FRAME_LENGTH] = {0};
 static uint16_t last_pressed_buttons = 0u;
 static GamepadFrame latest_frame = {0};
+static uint32_t last_valid_frame_ms = 0u;
 
 static uint8_t PS2_Transfer(uint8_t command)
 {
@@ -97,7 +99,14 @@ bool PS2_ReadFrame(GamepadFrame *frame)
 
     last_pressed_buttons = current_pressed_buttons;
     latest_frame = *frame;
+    last_valid_frame_ms = frame->received_ms;
     return true;
+}
+
+bool PS2_IsConnected(void)
+{
+    return latest_frame.valid &&
+           (uint32_t)(HAL_GetTick() - last_valid_frame_ms) <= PS2_CONNECTED_TIMEOUT_MS;
 }
 
 static void PS2_ShortPoll(void)

@@ -1,5 +1,8 @@
 #include "drive_control.h"
 
+#include <math.h>
+#include <stdio.h>
+
 #define GAMEPAD_LY_CENTRE 128u
 #define GAMEPAD_RX_CENTRE 127u
 
@@ -10,12 +13,17 @@ typedef struct {
     DriveCommand serial_command;
     uint32_t last_gamepad_frame_ms;
     uint32_t source_gate_ms;
+    uint32_t last_tick_ms;
     bool gamepad_frame_seen;
     bool source_request_pending;
     DriveSource requested_source;
     bool arm_request_pending;
     bool arm_request_neutral;
     bool brake_request_pending;
+    uint8_t serial_enable_last;           /* last en= code seen (DISABLE at boot) */
+    bool serial_arm_request_pending;
+    bool serial_arm_request_neutral;
+    bool serial_disable_request_pending;
     volatile uint8_t estop_pending;
 } DriveControlContext;
 
@@ -113,6 +121,84 @@ void DriveControl_SubmitSerialCommand(const DriveCommand *command)
     drive_control.serial_command = *command;
 }
 
+static bool SerialCommandIsNeutral(const DriveCommand *command)
+{
+    return fabsf(command->linear_mps) <= DRIVE_SERIAL_NEUTRAL_LINEAR_MPS &&
+           fabsf(command->angular_radps) <= DRIVE_SERIAL_NEUTRAL_ANGULAR_RADPS;
+}
+
+void DriveControl_SubmitSerialEnable(uint8_t enable_code, const DriveCommand *command)
+{
+    if (command == 0 || !command->valid || enable_code == DRIVE_SERIAL_EN_ABSENT)
+    {
+        return;
+    }
+
+    if (enable_code == DRIVE_SERIAL_EN_ARM)
+    {
+        drive_control.serial_arm_request_pending = true;
+        drive_control.serial_arm_request_neutral = SerialCommandIsNeutral(command);
+    }
+    else if (enable_code == DRIVE_SERIAL_EN_DISABLE &&
+             drive_control.serial_enable_last != DRIVE_SERIAL_EN_DISABLE)
+    {
+        drive_control.serial_disable_request_pending = true;
+    }
+
+    drive_control.serial_enable_last = enable_code;
+}
+
+bool DriveControl_ParseSerialPacket(const char *text,
+                                    uint32_t now_ms,
+                                    DriveCommand *command,
+                                    uint8_t *enable_code)
+{
+    float linear_mps;
+    float angular_radps;
+    int enable;
+    char trailing;
+    int matched;
+    uint8_t code = DRIVE_SERIAL_EN_ABSENT;
+
+    if (text == 0 || command == 0 || enable_code == 0)
+    {
+        return false;
+    }
+
+    /* New form first: exactly 3 conversions means nothing followed the frame. */
+    matched = sscanf(text, "vcx=%f,wc=%f,en=%d %c",
+                     &linear_mps, &angular_radps, &enable, &trailing);
+    if (matched == 3)
+    {
+        if (enable < 0 || enable > (int)DRIVE_SERIAL_EN_ARM)
+        {
+            return false;
+        }
+        code = (uint8_t)enable;
+    }
+    else if (matched == 4)
+    {
+        return false; /* trailing garbage / merged frames */
+    }
+    else if (sscanf(text, "vcx=%f,wc=%f %c",
+                    &linear_mps, &angular_radps, &trailing) != 2)
+    {
+        return false; /* legacy two-field form, no trailing data allowed */
+    }
+
+    if (!isfinite(linear_mps) || !isfinite(angular_radps))
+    {
+        return false;
+    }
+
+    command->valid = true;
+    command->received_ms = now_ms;
+    command->linear_mps = linear_mps;
+    command->angular_radps = angular_radps;
+    *enable_code = code;
+    return true;
+}
+
 void DriveControl_RequestSource(DriveSource source, uint32_t requested_ms)
 {
     (void)requested_ms;
@@ -170,6 +256,10 @@ void DriveControl_LatchEmergencyStopFromISR(void)
 
 void DriveControl_Tick(uint32_t now_ms, bool brake_wheels_stopped)
 {
+    bool serial_disable;
+
+    drive_control.last_tick_ms = now_ms;
+
     if (drive_control.estop_pending != 0u)
     {
         drive_control.state = DRIVE_STATE_ESTOP;
@@ -180,20 +270,23 @@ void DriveControl_Tick(uint32_t now_ms, bool brake_wheels_stopped)
         drive_control.source_request_pending = false;
         drive_control.arm_request_pending = false;
         drive_control.brake_request_pending = false;
+        drive_control.serial_arm_request_pending = false;
+        drive_control.serial_disable_request_pending = false;
         return;
     }
 
-    if (drive_control.state == DRIVE_STATE_ARMED && ActiveSourceTimedOut(now_ms))
-    {
-        EnterDisarmed(now_ms);
-    }
-    else if (drive_control.state == DRIVE_STATE_BRAKING && brake_wheels_stopped)
+    /* A serial Disable only counts while the serial source owns the robot, so
+     * the PS2 controller (gamepad source) always overrides the phone. */
+    serial_disable = drive_control.serial_disable_request_pending &&
+                     drive_control.source == DRIVE_SOURCE_SERIAL &&
+                     drive_control.state == DRIVE_STATE_ARMED;
+
+    if (drive_control.state == DRIVE_STATE_BRAKING && brake_wheels_stopped)
     {
         EnterDisarmed(now_ms);
     }
     else if (drive_control.state != DRIVE_STATE_BRAKING &&
-             drive_control.brake_request_pending &&
-             drive_control.source == DRIVE_SOURCE_GAMEPAD)
+             (drive_control.brake_request_pending || serial_disable))
     {
         drive_control.state = DRIVE_STATE_BRAKING;
     }
@@ -213,11 +306,23 @@ void DriveControl_Tick(uint32_t now_ms, bool brake_wheels_stopped)
             drive_control.source = drive_control.requested_source;
             RequireFreshCommand(now_ms);
         }
+        /* Phone arm: evaluated after any PS2 source switch so a PS2 R2 takeover
+         * in the same tick wins. */
+        if (drive_control.state == DRIVE_STATE_DISARMED &&
+            drive_control.source == DRIVE_SOURCE_SERIAL &&
+            drive_control.serial_arm_request_pending &&
+            drive_control.serial_arm_request_neutral)
+        {
+            drive_control.state = DRIVE_STATE_ARMED;
+            RequireFreshCommand(now_ms);
+        }
     }
 
     drive_control.source_request_pending = false;
     drive_control.arm_request_pending = false;
     drive_control.brake_request_pending = false;
+    drive_control.serial_arm_request_pending = false;
+    drive_control.serial_disable_request_pending = false;
 }
 
 DriveControlOutput DriveControl_GetOutput(void)
@@ -231,7 +336,8 @@ DriveControlOutput DriveControl_GetOutput(void)
         .angular_radps = 0.0f,
     };
 
-    if (drive_control.state != DRIVE_STATE_ARMED)
+    if (drive_control.state != DRIVE_STATE_ARMED ||
+        ActiveSourceTimedOut(drive_control.last_tick_ms))
     {
         return output;
     }
@@ -264,6 +370,17 @@ DriveSource DriveControl_GetSource(void)
 DriveState DriveControl_GetState(void)
 {
     return drive_control.state;
+}
+
+uint8_t DriveControl_GetCtrlMode(void)
+{
+    if (drive_control.state != DRIVE_STATE_ARMED)
+    {
+        return DRIVE_CTRL_MODE_DISABLED;
+    }
+
+    return (drive_control.source == DRIVE_SOURCE_GAMEPAD) ? DRIVE_CTRL_MODE_GAMEPAD
+                                                          : DRIVE_CTRL_MODE_SERIAL;
 }
 
 float DriveControl_MapAxis(uint8_t value, uint8_t centre, float maximum)

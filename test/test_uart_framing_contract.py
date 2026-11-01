@@ -7,7 +7,10 @@ USART_SOURCE = ROOT / "Core/Src/platform/usart.c"
 
 
 def function_body(source: str, name: str) -> str:
-    match = re.search(rf"(?m)^[ \t]*void\s+{name}\s*\([^)]*\)\s*\{{", source)
+    match = re.search(
+        rf"(?m)^[ \t]*[A-Za-z_][A-Za-z0-9_ \t\*]*\s+{name}\s*\([^)]*\)\s*\{{",
+        source,
+    )
     assert match, f"{name}() is missing"
     index = match.end()
     depth = 1
@@ -21,25 +24,28 @@ def function_body(source: str, name: str) -> str:
     return source[match.end() : index - 1]
 
 
-def test_dma_completion_only_marks_overflow_and_resynchronises() -> None:
+def test_receive_to_idle_uses_hal_managed_idle_callback() -> None:
     source = USART_SOURCE.read_text(encoding="utf-8", errors="ignore")
-    callback = function_body(source, "HAL_UART_RxCpltCallback")
-
-    assert "uart1_rx_overflow = 1u;" in callback
-    assert "memcpy" not in callback
-    assert "UART1_RX_Size" not in callback
-    assert "new_serial_data_received" not in callback
-    assert "HAL_UART_Receive_DMA" not in callback
-
-
-def test_idle_is_the_only_variable_length_packet_publisher() -> None:
-    source = USART_SOURCE.read_text(encoding="utf-8", errors="ignore")
+    start = function_body(source, "USART1_StartReceiveToIdle")
     handler = function_body(source, "USART1_IRQHandler")
+    callback = function_body(source, "HAL_UARTEx_RxEventCallback")
 
-    assert "uart1_rx_overflow == 0u" in handler
-    assert "dataLength > 0u" in handler
-    assert "dataLength < UART_RX_BUF_SIZE" in handler
-    assert "memcpy(UART1_RX_Buffer, DMA_RX_Buffer, dataLength);" in handler
-    assert "UART1_RX_Size = dataLength;" in handler
-    assert "new_serial_data_received = 1;" in handler
-    assert "uart1_rx_overflow = 0u;" in handler
+    assert "HAL_UARTEx_ReceiveToIdle_DMA" in start
+    assert "DMA_IT_HT" in start
+    assert handler.strip() == "HAL_UART_IRQHandler(&huart1);"
+    assert "HAL_UARTEx_GetRxEventType(huart) == HAL_UART_RXEVENT_IDLE" in callback
+    assert "HAL_UART_DMAStop" not in source
+    assert "HAL_UART_Receive_DMA" not in source
+
+
+def test_idle_callback_publishes_a_terminated_variable_length_packet() -> None:
+    source = USART_SOURCE.read_text(encoding="utf-8", errors="ignore")
+    callback = function_body(source, "HAL_UARTEx_RxEventCallback")
+
+    assert "size > 0u" in callback
+    assert "size < UART_RX_BUF_SIZE" in callback
+    assert "memcpy(UART1_RX_Buffer, DMA_RX_Buffer, size);" in callback
+    assert "UART1_RX_Buffer[size] = '\\0';" in callback
+    assert "UART1_RX_Size = size;" in callback
+    assert "new_serial_data_received = 1u;" in callback
+    assert "(void)USART1_StartReceiveToIdle();" in callback

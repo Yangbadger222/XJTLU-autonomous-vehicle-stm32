@@ -109,13 +109,22 @@ static void TestArmAndSourceSwitchOrdering(void)
     assert(DriveControl_GetOutput().authorised);
 }
 
-static void TestTimeoutsApplyOnlyToActiveSource(void)
+static void TestTimeoutStopsMotionButKeepsControllerArmed(void)
 {
     DriveControl_Init(0u);
     ArmSerial(1u);
     DriveControl_Tick(252u, false);
-    assert(DriveControl_GetState() == DRIVE_STATE_DISARMED);
+    assert(DriveControl_GetState() == DRIVE_STATE_ARMED);
     assert(!DriveControl_GetOutput().authorised);
+
+    DriveControl_SubmitSerialCommand(&(DriveCommand){
+        .valid = true,
+        .received_ms = 253u,
+        .linear_mps = 0.4f,
+        .angular_radps = -0.2f,
+    });
+    DriveControl_Tick(253u, false);
+    assert(DriveControl_GetOutput().authorised);
 
     DriveControl_Init(0u);
     ArmSerial(1u);
@@ -130,27 +139,22 @@ static void TestTimeoutsApplyOnlyToActiveSource(void)
     assert(DriveControl_GetOutput().authorised);
 
     DriveControl_Tick(399u, false);
-    assert(DriveControl_GetState() == DRIVE_STATE_DISARMED);
+    assert(DriveControl_GetState() == DRIVE_STATE_ARMED);
+    assert(!DriveControl_GetOutput().authorised);
 }
 
-static void TestRearmRequiresPostArmCommand(void)
+static void TestFreshCommandResumesWithoutAnotherArmRequest(void)
 {
-    GamepadFrame arm_frame = GamepadFrameAt(253u, 128u, 127u);
-    DriveCommand command = CommandAt(254u, 0.4f, -0.2f);
+    DriveCommand command = CommandAt(253u, 0.4f, -0.2f);
 
     DriveControl_Init(0u);
     ArmSerial(1u);
     DriveControl_Tick(252u, false);
-    assert(DriveControl_GetState() == DRIVE_STATE_DISARMED);
-
-    DriveControl_SubmitGamepadFrame(&arm_frame);
-    DriveControl_RequestArm(&arm_frame);
-    DriveControl_Tick(253u, false);
     assert(DriveControl_GetState() == DRIVE_STATE_ARMED);
     assert(!DriveControl_GetOutput().authorised);
 
     DriveControl_SubmitSerialCommand(&command);
-    DriveControl_Tick(254u, false);
+    DriveControl_Tick(253u, false);
     assert(DriveControl_GetOutput().authorised);
 }
 
@@ -160,9 +164,10 @@ static void TestBrakingAndEstopRejectOtherRequests(void)
 
     DriveControl_Init(0u);
     ArmSerial(1u);
+    /* PS2 B overrides even when the serial source (phone / ROS) owns the robot. */
     DriveControl_RequestBrake(2u);
     DriveControl_Tick(2u, false);
-    assert(DriveControl_GetState() == DRIVE_STATE_ARMED);
+    assert(DriveControl_GetState() == DRIVE_STATE_BRAKING);
 
     DriveControl_Init(0u);
     SubmitGamepad(1u, 0.2f, 0.0f);
@@ -291,15 +296,193 @@ static void TestPs2FrameValidationAndEdges(void)
                                    &pressed_buttons));
 }
 
+static void PhoneArm(uint32_t timestamp)
+{
+    DriveCommand zero = CommandAt(timestamp, 0.0f, 0.0f);
+
+    DriveControl_SubmitSerialCommand(&zero);
+    DriveControl_SubmitSerialEnable(DRIVE_SERIAL_EN_ARM, &zero);
+    DriveControl_Tick(timestamp, false);
+}
+
+static void PhoneCode(uint8_t code, uint32_t timestamp, float linear)
+{
+    DriveCommand command = CommandAt(timestamp, linear, 0.0f);
+
+    DriveControl_SubmitSerialCommand(&command);
+    DriveControl_SubmitSerialEnable(code, &command);
+    DriveControl_Tick(timestamp, false);
+}
+
+static void TestParseSerialPacket(void)
+{
+    DriveCommand command;
+    uint8_t code;
+
+    assert(DriveControl_ParseSerialPacket("vcx=0.500,wc=-0.200,en=2\n", 7u, &command, &code));
+    assert(code == DRIVE_SERIAL_EN_ARM && command.valid && command.received_ms == 7u);
+    assert(fabsf(command.linear_mps - 0.5f) < 0.0001f);
+    assert(fabsf(command.angular_radps + 0.2f) < 0.0001f);
+
+    assert(DriveControl_ParseSerialPacket("vcx=0.000,wc=0.000,en=0\n", 1u, &command, &code));
+    assert(code == DRIVE_SERIAL_EN_DISABLE);
+    assert(DriveControl_ParseSerialPacket("vcx=0.1,wc=0.2,en=1", 1u, &command, &code));
+    assert(code == DRIVE_SERIAL_EN_NORMAL);
+    assert(DriveControl_ParseSerialPacket("vcx=0.1,wc=0.2,en=1\r\n", 1u, &command, &code));
+    assert(code == DRIVE_SERIAL_EN_NORMAL);
+
+    /* Legacy two-field form still works and carries no enable code. */
+    assert(DriveControl_ParseSerialPacket("vcx=0.500,wc=-0.200\n", 1u, &command, &code));
+    assert(code == DRIVE_SERIAL_EN_ABSENT);
+
+    /* The exact frame that the old parser silently dropped. */
+    assert(DriveControl_ParseSerialPacket("vcx=0.250,wc=0.000,en=1\n", 1u, &command, &code));
+
+    assert(!DriveControl_ParseSerialPacket("vcx=0.5,wc=0.1,en=3\n", 1u, &command, &code));
+    assert(!DriveControl_ParseSerialPacket("vcx=0.5,wc=0.1,en=-1\n", 1u, &command, &code));
+    assert(!DriveControl_ParseSerialPacket("vcx=0.5,wc=0.1,en=\n", 1u, &command, &code));
+    assert(!DriveControl_ParseSerialPacket("vcx=0.5,wc=0.1,x\n", 1u, &command, &code));
+    assert(!DriveControl_ParseSerialPacket("vcx=0.5,wc=0.1\nvcx=0.5,wc=0.1\n", 1u, &command, &code));
+    assert(!DriveControl_ParseSerialPacket(
+        "vcx=0.5,wc=0.1,en=1\nvcx=0.5,wc=0.1,en=1\n", 1u, &command, &code));
+    assert(!DriveControl_ParseSerialPacket("vcx=nan,wc=0.1,en=1\n", 1u, &command, &code));
+    assert(!DriveControl_ParseSerialPacket("vcx=inf,wc=0.1\n", 1u, &command, &code));
+    assert(!DriveControl_ParseSerialPacket("hello\n", 1u, &command, &code));
+    assert(!DriveControl_ParseSerialPacket("", 1u, &command, &code));
+    assert(!DriveControl_ParseSerialPacket(0, 1u, &command, &code));
+}
+
+static void TestPhoneArmDrivesWithoutPs2(void)
+{
+    DriveControl_Init(0u);
+    assert(DriveControl_GetCtrlMode() == DRIVE_CTRL_MODE_DISABLED);
+
+    /* Disarmed: phone commands are ignored. */
+    PhoneCode(DRIVE_SERIAL_EN_NORMAL, 1u, 0.3f);
+    assert(!DriveControl_GetOutput().authorised);
+
+    PhoneArm(2u);
+    assert(DriveControl_GetState() == DRIVE_STATE_ARMED);
+    assert(DriveControl_GetCtrlMode() == DRIVE_CTRL_MODE_SERIAL);
+    assert(!DriveControl_GetOutput().authorised); /* needs a post-arm command */
+
+    PhoneCode(DRIVE_SERIAL_EN_NORMAL, 3u, 0.3f);
+    assert(DriveControl_GetOutput().authorised);
+    assert(fabsf(DriveControl_GetOutput().linear_mps - 0.3f) < 0.0001f);
+}
+
+static void TestPhoneArmGuards(void)
+{
+    DriveCommand moving = CommandAt(1u, 0.3f, 0.0f);
+
+    /* A non-neutral arm request is refused. */
+    DriveControl_Init(0u);
+    DriveControl_SubmitSerialCommand(&moving);
+    DriveControl_SubmitSerialEnable(DRIVE_SERIAL_EN_ARM, &moving);
+    DriveControl_Tick(1u, false);
+    assert(DriveControl_GetState() == DRIVE_STATE_DISARMED);
+
+    /* en=1 (what ROS sends) and legacy frames never arm. */
+    DriveControl_Init(0u);
+    PhoneCode(DRIVE_SERIAL_EN_NORMAL, 1u, 0.0f);
+    PhoneCode(DRIVE_SERIAL_EN_ABSENT, 2u, 0.0f);
+    assert(DriveControl_GetState() == DRIVE_STATE_DISARMED);
+
+    /* PS2 owns the robot (gamepad source): the phone cannot arm. */
+    DriveControl_Init(0u);
+    DriveControl_RequestSource(DRIVE_SOURCE_GAMEPAD, 1u);
+    DriveControl_Tick(1u, false);
+    PhoneArm(2u);
+    assert(DriveControl_GetState() == DRIVE_STATE_DISARMED);
+
+    /* A PS2 R2 takeover in the same tick as the phone arm wins. */
+    DriveControl_Init(0u);
+    DriveControl_RequestSource(DRIVE_SOURCE_GAMEPAD, 1u);
+    DriveControl_SubmitSerialEnable(DRIVE_SERIAL_EN_ARM, &(DriveCommand){
+        .valid = true, .received_ms = 1u});
+    DriveControl_Tick(1u, false);
+    assert(DriveControl_GetState() == DRIVE_STATE_DISARMED);
+
+    /* A latched e-stop cannot be cleared by the phone. */
+    DriveControl_Init(0u);
+    DriveControl_LatchEmergencyStopFromISR();
+    PhoneArm(2u);
+    assert(DriveControl_GetState() == DRIVE_STATE_ESTOP);
+}
+
+static void TestPhoneDisableBrakesAndIsEdgeTriggered(void)
+{
+    DriveControl_Init(0u);
+    PhoneArm(1u);
+    PhoneCode(DRIVE_SERIAL_EN_NORMAL, 2u, 0.3f);
+    assert(DriveControl_GetOutput().authorised);
+
+    /* Disable -> active brake (BRAKING), then disarmed once the wheels stop. */
+    PhoneCode(DRIVE_SERIAL_EN_DISABLE, 3u, 0.0f);
+    assert(DriveControl_GetState() == DRIVE_STATE_BRAKING);
+    assert(!DriveControl_GetOutput().authorised);
+    DriveControl_Tick(4u, true);
+    assert(DriveControl_GetState() == DRIVE_STATE_DISARMED);
+    assert(DriveControl_GetCtrlMode() == DRIVE_CTRL_MODE_DISABLED);
+
+    /* en=1 after a disable does not re-arm; only a new en=2 does. */
+    PhoneCode(DRIVE_SERIAL_EN_NORMAL, 5u, 0.0f);
+    assert(DriveControl_GetState() == DRIVE_STATE_DISARMED);
+    PhoneArm(6u);
+    assert(DriveControl_GetState() == DRIVE_STATE_ARMED);
+
+    /* A robot armed from the PS2 controller is not braked by an en=0 heartbeat
+     * (no falling edge), but is by a real enabled -> disabled transition. */
+    DriveControl_Init(0u);
+    ArmSerial(1u);
+    PhoneCode(DRIVE_SERIAL_EN_DISABLE, 5u, 0.0f);
+    PhoneCode(DRIVE_SERIAL_EN_DISABLE, 6u, 0.0f);
+    assert(DriveControl_GetState() == DRIVE_STATE_ARMED);
+    PhoneCode(DRIVE_SERIAL_EN_NORMAL, 7u, 0.0f);
+    PhoneCode(DRIVE_SERIAL_EN_DISABLE, 8u, 0.0f);
+    assert(DriveControl_GetState() == DRIVE_STATE_BRAKING);
+}
+
+static void TestPs2OverridesPhone(void)
+{
+    /* R2 hands control to the PS2 controller; phone Disable is then ignored. */
+    DriveControl_Init(0u);
+    PhoneArm(1u);
+    PhoneCode(DRIVE_SERIAL_EN_NORMAL, 2u, 0.2f);
+    DriveControl_RequestSource(DRIVE_SOURCE_GAMEPAD, 3u);
+    DriveControl_Tick(3u, false);
+    assert(DriveControl_GetCtrlMode() == DRIVE_CTRL_MODE_GAMEPAD);
+    assert(!DriveControl_GetOutput().authorised); /* needs a fresh PS2 command */
+    PhoneCode(DRIVE_SERIAL_EN_DISABLE, 4u, 0.0f);
+    assert(DriveControl_GetState() == DRIVE_STATE_ARMED);
+    SubmitGamepad(5u, 0.4f, 0.0f);
+    DriveControl_Tick(5u, false);
+    assert(DriveControl_GetOutput().authorised);
+    assert(fabsf(DriveControl_GetOutput().linear_mps - 0.4f) < 0.0001f);
+
+    /* PS2 B brakes a phone-driven robot. */
+    DriveControl_Init(0u);
+    PhoneArm(1u);
+    PhoneCode(DRIVE_SERIAL_EN_NORMAL, 2u, 0.2f);
+    DriveControl_RequestBrake(3u);
+    DriveControl_Tick(3u, false);
+    assert(DriveControl_GetState() == DRIVE_STATE_BRAKING);
+}
+
 int main(void)
 {
     TestInvalidGamepadCannotChangeSerial();
     TestSwitchNeedsPostSwitchCommand();
     TestArmAndSourceSwitchOrdering();
-    TestTimeoutsApplyOnlyToActiveSource();
-    TestRearmRequiresPostArmCommand();
+    TestTimeoutStopsMotionButKeepsControllerArmed();
+    TestFreshCommandResumesWithoutAnotherArmRequest();
     TestBrakingAndEstopRejectOtherRequests();
     TestNeutralBandAndAxisMapping();
     TestPs2FrameValidationAndEdges();
+    TestParseSerialPacket();
+    TestPhoneArmDrivesWithoutPs2();
+    TestPhoneArmGuards();
+    TestPhoneDisableBrakesAndIsEdgeTriggered();
+    TestPs2OverridesPhone();
     return 0;
 }

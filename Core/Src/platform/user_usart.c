@@ -8,20 +8,27 @@
 void usart_printf(const char *fmt,...)
 {
     static uint8_t tx_buf[256] = {0};
-    static va_list ap;
-    static uint16_t len;
+    va_list ap;
+    int len;
+
+    // The DMA reads tx_buf after this function returns.  Never format a new
+    // frame into it until the prior DMA transfer has completed.
+    if (huart1.gState != HAL_UART_STATE_READY)
+    {
+        return;
+    }
+
     va_start(ap, fmt);
-
-    //return length of string 
-    //∑µªÿ◊÷∑˚¥Æ≥§∂»
-    len = vsprintf((char *)tx_buf, fmt, ap);
-
+    len = vsnprintf((char *)tx_buf, sizeof(tx_buf), fmt, ap);
     va_end(ap);
-    //HAL_UART_Transmit(&huart1, (uint8_t*)"Hello World\r\n", strlen("Hello World\r\n"), HAL_MAX_DELAY);
 
+    // Drop an oversized diagnostic frame rather than transmit a truncated
+    // record that would desynchronise the host-side 16-field parser.
+    if (len <= 0 || len >= (int)sizeof(tx_buf))
+    {
+        return;
+    }
 
-   HAL_UART_Transmit_DMA(&huart1,tx_buf, len);
-
+    (void)HAL_UART_Transmit_DMA(&huart1, tx_buf, (uint16_t)len);
 }
-
 
